@@ -1,0 +1,9 @@
+# Nextflow
+work/
+.nextflow/
+.nextflow.log*
+results/
+results_test/
+
+# container images
+*.sif

@@ -1,0 +1,182 @@
+Bootstrap: docker
+From: ubuntu:24.04
+
+# One image with every pipeline tool for R9.4.1 fast5 data.
+# Versions and build recipes follow the Lmod modules in /mnt/data1/tools/26.11
+# (hpc-setup-main/tools/nanopore/legacy.sh, pkgs.json).
+#
+# Build:  containers/build.sh            (apptainer build --fakeroot ...)
+#         -> fiberseq-cpg-r9_v<version>.sif, version from nextflow.config
+# GPU:    run with --nv (the Nextflow apptainer/singularity profiles add it
+#         for processes labelled 'gpu'). Guppy bundles its own CUDA libraries.
+#         guppy_basecaller* use the GPU build and fail without a CUDA driver;
+#         GUPPY_CPU=1 selects the CPU build (pipeline: --cpu).
+
+%arguments
+    VERSION=unknown
+
+%labels
+    org.opencontainers.image.title fiberseq-cpg-r9
+    org.opencontainers.image.version {{ VERSION }}
+    guppy.version     6.5.7
+    nanopolish.version 0.13.2
+    minimap2.version  2.31
+    samtools.version  1.25
+    htslib.version    1.25
+    python.version    3.14.10
+
+%files
+    requirements.txt /opt/requirements.txt
+
+%environment
+    export LC_ALL=C.UTF-8
+    export PATH=/opt/python/bin:/opt/nanopolish/bin:/opt/nanopolish/scripts:/opt/minimap2:/usr/local/bin:$PATH
+    export HDF5_PLUGIN_PATH=/opt/nanopolish/lib/hdf5_plugin
+    export PYTHONNOUSERSITE=1
+
+%post
+    set -eu
+    export DEBIAN_FRONTEND=noninteractive
+    # fakeroot builds cannot restore foreign uids/gids from tarballs
+    export TAR_OPTIONS=--no-same-owner
+    NPROC=$(nproc)
+
+    GUPPY_VERSION=6.5.7
+    NANOPOLISH_VERSION=0.13.2
+    MINIMAP2_VERSION=2.31
+    HTSLIB_VERSION=1.25
+    SAMTOOLS_VERSION=1.25
+    PYTHON_VERSION=3.14.10
+    HDF5_VERSION=1.8.14
+    EIGEN_VERSION=3.3.7
+    VBZ_VERSION=1.0.1
+
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        ca-certificates wget bzip2 xz-utils unzip procps pigz \
+        build-essential pkg-config \
+        zlib1g-dev libbz2-dev liblzma-dev libcurl4-openssl-dev libssl-dev \
+        libncurses-dev libffi-dev libsqlite3-dev libreadline-dev uuid-dev
+
+    BUILD=/tmp/build
+    mkdir -p "$BUILD"
+    cd "$BUILD"
+
+    ### ont-guppy: GPU build (/opt/ont-guppy) + CPU build (/opt/ont-guppy-cpu) ###
+    # Every binary of the GPU build links libcuda.so.1, which exists only with --nv.
+    # Neither bin/ goes on PATH (guppy bundles minimap2 2.24); /usr/local/bin/guppy_*
+    # wrappers pick the build:
+    #   guppy_barcoder, guppy_aligner: always the CPU build (no GPU needed)
+    #   all others (basecaller, server, ...): GPU build, error if no CUDA driver;
+    #   GUPPY_CPU=1 selects the CPU build.
+    for FLAVOUR in ont-guppy ont-guppy-cpu; do
+        wget -nv -O guppy.tar.gz \
+            "https://cdn.oxfordnanoportal.com/software/analysis/${FLAVOUR}_${GUPPY_VERSION}_linux64.tar.gz"
+        tar -xzf guppy.tar.gz -C /opt
+        rm -f guppy.tar.gz
+    done
+    cat > /usr/local/bin/guppy_wrapper <<'WRAP'
+#!/bin/sh
+# guppy_barcoder/guppy_aligner: CPU build. Others: GPU build, or CPU build with GUPPY_CPU=1.
+name=$(basename "$0")
+case "$name" in
+    guppy_barcoder|guppy_aligner) exec "/opt/ont-guppy-cpu/bin/$name" "$@" ;;
+esac
+if [ "${GUPPY_CPU:-0}" = 1 ]; then
+    exec "/opt/ont-guppy-cpu/bin/$name" "$@"
+fi
+if ldd "/opt/ont-guppy/bin/$name" 2>/dev/null | grep -q 'libcuda.so.1 => not found'; then
+    echo "ERROR: $name: no CUDA driver visible (run apptainer with --nv on a GPU node)," >&2
+    echo "       or use the CPU build: pipeline --cpu / GUPPY_CPU=1" >&2
+    exit 1
+fi
+exec "/opt/ont-guppy/bin/$name" "$@"
+WRAP
+    chmod 755 /usr/local/bin/guppy_wrapper
+    for B in /opt/ont-guppy/bin/guppy_*; do
+        ln -sf guppy_wrapper "/usr/local/bin/$(basename "$B")"
+    done
+
+    ### minimap2 (precompiled) ###
+    wget -nv -O minimap2.tar.bz2 \
+        "https://github.com/lh3/minimap2/releases/download/v${MINIMAP2_VERSION}/minimap2-${MINIMAP2_VERSION}_x64-linux.tar.bz2"
+    tar -xjf minimap2.tar.bz2
+    mv "minimap2-${MINIMAP2_VERSION}_x64-linux" /opt/minimap2
+
+    ### htslib + samtools ###
+    wget -nv "https://github.com/samtools/htslib/releases/download/${HTSLIB_VERSION}/htslib-${HTSLIB_VERSION}.tar.bz2"
+    tar -xjf "htslib-${HTSLIB_VERSION}.tar.bz2"
+    (cd "htslib-${HTSLIB_VERSION}" && ./configure --prefix=/usr/local --enable-libcurl \
+        && make -j "$NPROC" && make install)
+    wget -nv "https://github.com/samtools/samtools/releases/download/${SAMTOOLS_VERSION}/samtools-${SAMTOOLS_VERSION}.tar.bz2"
+    tar -xjf "samtools-${SAMTOOLS_VERSION}.tar.bz2"
+    (cd "samtools-${SAMTOOLS_VERSION}" && ./configure --prefix=/usr/local --with-htslib=/usr/local \
+        && make -j "$NPROC" && make install)
+    ldconfig
+
+    ### nanopolish 0.13.2 (same recipe as the module) ###
+    # GitHub has no release tarball with submodules: fetch the tag and the
+    # submodule commits pinned by v0.13.2 separately.
+    NP=$BUILD/nanopolish
+    mkdir -p "$NP"
+    wget -nv -O nanopolish.tar.gz "https://github.com/jts/nanopolish/archive/refs/tags/v${NANOPOLISH_VERSION}.tar.gz"
+    tar -xzf nanopolish.tar.gz -C "$NP" --strip-components=1
+    for SUB in \
+        "htslib|samtools/htslib|3dc96c5699a26c5a46e3ccca4092b3801e1874f4" \
+        "minimap2|lh3/minimap2|d2de282d21e9b621dc5f6cef293cb60b93cc553d" \
+        "fast5|mateidavid/fast5|18d6e346cadb9990ff8287e54447f90e76dd79bc"
+    do
+        SUB_DIR=${SUB%%|*}; REST=${SUB#*|}; SUB_REPO=${REST%%|*}; SUB_COMMIT=${REST#*|}
+        wget -nv -O sub.tar.gz "https://github.com/${SUB_REPO}/archive/${SUB_COMMIT}.tar.gz"
+        mkdir -p "$NP/$SUB_DIR"
+        tar -xzf sub.tar.gz -C "$NP/$SUB_DIR" --strip-components=1
+        rm -f sub.tar.gz
+    done
+    wget -nv -O "$NP/hdf5-${HDF5_VERSION}.tar.gz" \
+        "https://support.hdfgroup.org/ftp/HDF5/releases/hdf5-1.8/hdf5-${HDF5_VERSION}/src/hdf5-${HDF5_VERSION}.tar.gz"
+    wget -nv -O eigen.tar.bz2 "https://gitlab.com/libeigen/eigen/-/archive/${EIGEN_VERSION}/eigen-${EIGEN_VERSION}.tar.bz2"
+    mkdir -p "$NP/eigen"
+    tar -xjf eigen.tar.bz2 -C "$NP/eigen" --strip-components=1
+    # HDF5 first: a plain `make -j` races on hdf5.h
+    (cd "$NP" && make -j "$NPROC" lib/libhdf5.a && make -j "$NPROC")
+    mkdir -p /opt/nanopolish/bin /opt/nanopolish/lib/hdf5_plugin
+    cp "$NP/nanopolish" /opt/nanopolish/bin/
+    cp -r "$NP/scripts" /opt/nanopolish/
+    # VBZ HDF5 plugin (VBZ-compressed fast5)
+    wget -nv -O vbz.whl \
+        "https://files.pythonhosted.org/packages/d2/dd/eab7a9cac698afd8d4d469d703303390a88570ace01da358088459a6a48d/vbz_h5py_plugin-${VBZ_VERSION}-py3-none-any.whl"
+    unzip -p vbz.whl vbz_h5py_plugin/lib/libvbz_hdf_plugin_x86_64.so \
+        > /opt/nanopolish/lib/hdf5_plugin/libvbz_hdf_plugin.so
+
+    ### Python 3.14 + pysam / numpy (pins from the working venv) ###
+    wget -nv "https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tar.xz"
+    tar -xJf "Python-${PYTHON_VERSION}.tar.xz"
+    (cd "Python-${PYTHON_VERSION}" && ./configure --prefix=/opt/python --with-ensurepip=install \
+        && make -j "$NPROC" && make install)
+    ln -sf python3 /opt/python/bin/python
+    /opt/python/bin/python3 -m pip install --no-cache-dir -r /opt/requirements.txt
+
+    chmod -R a+rX /opt
+
+    ### clean up ###
+    cd /
+    rm -rf "$BUILD"
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+
+%test
+    set -e
+    export PATH=/opt/python/bin:/opt/nanopolish/bin:/opt/minimap2:/usr/local/bin:$PATH
+    GUPPY_CPU=1 guppy_basecaller --version | head -1
+    guppy_barcoder --version | head -1
+    # without --nv the GPU build must refuse to run (no silent CPU fallback)
+    if guppy_basecaller --version >/dev/null 2>&1; then
+        ldd /opt/ont-guppy/bin/guppy_basecaller | grep -q 'libcuda.so.1 => /' \
+            || { echo "guppy_basecaller ran without a CUDA driver"; exit 1; }
+    fi
+    test "$(minimap2 --version)" = "2.31-r1302" || { echo "wrong minimap2: $(minimap2 --version)"; exit 1; }
+    samtools --version | head -1
+    nanopolish --version | head -1
+    python3 --version
+    python3 -c "import pysam, numpy; print('pysam', pysam.__version__, 'numpy', numpy.__version__)"
+    test -s /opt/nanopolish/lib/hdf5_plugin/libvbz_hdf_plugin.so
